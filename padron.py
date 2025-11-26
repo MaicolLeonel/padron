@@ -1,9 +1,7 @@
-# app.py - Sistema Integral de Militancia (FINAL + Multi Cruce)
+# app.py - Padrón Unidad Roja y Blanca (STREAMLIT CLOUD COMPATIBLE - SIN OCR)
 import streamlit as st
 import pandas as pd
 import pdfplumber
-from pdf2image import convert_from_bytes
-import pytesseract
 import re
 from io import BytesIO, StringIO
 from fpdf import FPDF
@@ -16,9 +14,9 @@ warnings.filterwarnings("ignore")
 st.set_page_config(page_title="Unidad Roja y Blanca - Padrón", layout="wide")
 DEFAULT_LIST_NAME = "unidad roja y blanca"
 
-# ---------------------------------------------------------------------
-# PARSEADOR DE LÍNEAS DE PDF
-# ---------------------------------------------------------------------
+# ---------------------------------------------------
+# PARSEADOR PARA PDFs CON TEXTO
+# ---------------------------------------------------
 def parse_line_by_pattern(line):
     line = line.strip()
     if not line:
@@ -41,16 +39,12 @@ def parse_line_by_pattern(line):
         rest = " ".join(parts[1:]).strip()
 
     tokens = rest.split(" ")
-
     if len(tokens) >= 3:
         apellido = " ".join(tokens[:2])
         nombre = " ".join(tokens[2:])
-    elif len(tokens) == 2:
-        apellido = tokens[0]
-        nombre = tokens[1]
     else:
         apellido = tokens[0] if tokens else ""
-        nombre = ""
+        nombre = " ".join(tokens[1:]) if len(tokens) >= 2 else ""
 
     return {
         "n": idx,
@@ -65,246 +59,190 @@ def parse_text_block_to_df(text):
         p = parse_line_by_pattern(line)
         if p and (p["dni"] or p["apellido"] or p["nombre"]):
             rows.append(p)
-    return pd.DataFrame(rows) if rows else pd.DataFrame()
+    return pd.DataFrame(rows)
 
-# ---------------------------------------------------------------------
-# EXTRACCIÓN DE TEXTO
-# ---------------------------------------------------------------------
-def extract_text_with_pdfplumber(raw):
-    txt = ""
+# ---------------------------------------------------
+# LEER PDF (SOLO TEXTO)
+# ---------------------------------------------------
+def read_pdf_text(pdf_bytes):
+    text = ""
     try:
-        with pdfplumber.open(BytesIO(raw)) as pdf:
-            for p in pdf.pages:
-                t = p.extract_text()
+        with pdfplumber.open(BytesIO(pdf_bytes)) as pdf:
+            for page in pdf.pages:
+                t = page.extract_text()
                 if t:
-                    txt += t + "\n"
+                    text += t + "\n"
     except:
-        pass
-    return txt
+        text = ""
+    return text
 
-def extract_text_with_ocr(raw):
-    txt = ""
-    try:
-        imgs = convert_from_bytes(raw, dpi=250)
-        for img in imgs:
-            txt += pytesseract.image_to_string(img, lang="spa") + "\n"
-    except:
-        pass
-    return txt
-
-# ---------------------------------------------------------------------
-# NORMALIZACIÓN DE EXCEL/CSV
-# ---------------------------------------------------------------------
+# ---------------------------------------------------
+# NORMALIZAR EXCEL / CSV
+# ---------------------------------------------------
 def normalize_excel_df(df):
     out = pd.DataFrame()
     out["n"] = df.index.astype(str)
 
     col_dni = next((c for c in df.columns if "dni" in c.lower()), None)
-    out["dni"] = df[col_dni].astype(str).str.replace(r"\D", "", regex=True).str.strip() if col_dni else ""
+    out["dni"] = df[col_dni].astype(str).str.replace(r"\D", "", regex=True) if col_dni else ""
 
     col_ap = next((c for c in df.columns if "apell" in c.lower()), None)
     col_no = next((c for c in df.columns if "nom" in c.lower()), None)
+
     out["apellido"] = df[col_ap].astype(str).str.title().str.strip() if col_ap else ""
     out["nombre"] = df[col_no].astype(str).str.title().str.strip() if col_no else ""
 
-    col_mail = next((c for c in df.columns if "mail" in c.lower() or
-                     "email" in c.lower() or
-                     "domicilio" in c.lower() or
-                     "direc" in c.lower()), None)
+    # Mails: domicilio/dirección también se interpreta como mail
+    col_mail = next((c for c in df.columns if any(x in c.lower() for x in ["mail","email","domicilio","direccion"])), None)
     out["mail"] = df[col_mail].astype(str).str.strip() if col_mail else ""
 
-    col_ing = next((c for c in df.columns if any(x in c.lower() for x in
-                                                 ["ingreso","fecha","alta","inscrip"])), None)
-
-    out["fecha_ingreso"] = pd.to_datetime(df[col_ing], errors="coerce") if col_ing else pd.NaT
+    # fecha ingreso
+    col_ing = next((c for c in df.columns if any(x in c.lower() for x in ["fecha","ingreso","inscrip","alta"])), None)
+    out["fecha_ingreso"] = pd.to_datetime(df[col_ing], errors="ignore") if col_ing else ""
 
     return out
 
-# ---------------------------------------------------------------------
-# LECTURA GENERAL
-# ---------------------------------------------------------------------
-def load_file_to_df(file):
-    name = file.name.lower()
-    raw = file.read()
+# ---------------------------------------------------
+# CARGAR PDF/EXCEL/CSV
+# ---------------------------------------------------
+def load_file_to_df(uploaded_file):
+    name = uploaded_file.name.lower()
+    raw = uploaded_file.read()
 
+    # PDF con texto (NO OCR)
     if name.endswith(".pdf"):
-        text = extract_text_with_pdfplumber(raw)
+        text = read_pdf_text(raw)
         df = parse_text_block_to_df(text)
-        if df.empty:
-            st.info("Aplicando OCR (tarda unos segundos)...")
-            text = extract_text_with_ocr(raw)
-            df = parse_text_block_to_df(text)
-        df["mail"] = ""
-        df["fecha_ingreso"] = pd.NaT
+        if not df.empty:
+            df["mail"] = ""
+            df["fecha_ingreso"] = ""
         return df
 
-    if name.endswith((".xlsx", ".xls")):
-        return normalize_excel_df(pd.read_excel(BytesIO(raw), engine="openpyxl"))
+    # Excel
+    if name.endswith((".xlsx",".xls")):
+        df_excel = pd.read_excel(BytesIO(raw), engine="openpyxl")
+        return normalize_excel_df(df_excel)
 
+    # CSV
     if name.endswith(".csv"):
-        try:
-            df_csv = pd.read_csv(StringIO(raw.decode("utf-8")))
-        except:
-            df_csv = pd.read_csv(StringIO(raw.decode("latin1")))
+        df_csv = pd.read_csv(StringIO(raw.decode("utf-8", errors="ignore")))
         return normalize_excel_df(df_csv)
 
     return pd.DataFrame()
 
-# ---------------------------------------------------------------------
+# ---------------------------------------------------
 # UI PRINCIPAL
-# ---------------------------------------------------------------------
-st.title("📋 Sistema Integral de Militancia – Unidad Roja y Blanca")
-st.write("Subí un Padrón y automáticamente procesamos DNI, Apellido, Nombre, Mail y Fecha de Ingreso.")
+# ---------------------------------------------------
+st.title("📋 Sistema de Militancia – Unidad Roja y Blanca")
+st.write("Compatible con PDF (texto), Excel y CSV. OCR deshabilitado para Streamlit Cloud.")
 
-uploaded = st.file_uploader("Subir padrón principal", type=["pdf","xlsx","xls","csv"])
+st.subheader("📤 Cargar 1 o más padrones")
+files = st.file_uploader("Subir padrones", type=["pdf","xlsx","xls","csv"], accept_multiple_files=True)
 
-if not uploaded:
+if not files:
     st.stop()
 
-df = load_file_to_df(uploaded)
+dfs = []
+for f in files:
+    df_temp = load_file_to_df(f)
+    if not df_temp.empty:
+        dfs.append(df_temp)
 
-if df.empty:
-    st.error("No se pudo leer el archivo")
+if not dfs:
+    st.error("Ningún archivo pudo procesarse.")
     st.stop()
 
-# Normalización final
-df["dni"] = df["dni"].astype(str).str.replace(r"\D", "", regex=True)
-df["apellido"] = df["apellido"].astype(str).str.title()
-df["nombre"] = df["nombre"].astype(str).str.title()
-df["mail"] = df["mail"].astype(str).str.strip()
+# UNIFICAR
+df = pd.concat(dfs, ignore_index=True)
+df["dni"] = df["dni"].astype(str).str.replace(r"\D","",regex=True)
+df["apellido"] = df["apellido"].astype(str).str.title().str.strip()
+df["nombre"] = df["nombre"].astype(str).str.title().str.strip()
 
-st.subheader("Vista previa")
-st.dataframe(df.head(200), use_container_width=True)
+st.success(f"{len(dfs)} padrones cargados correctamente.")
+st.dataframe(df.head(200))
 
-# BUSCADOR
-st.subheader("🔎 Buscar socio")
-q = st.text_input("Buscar por DNI / Apellido / Nombre / Mail")
+# ---------------------------------------------------
+# CRUZAR PADRONES AUTOMÁTICAMENTE (3 o más)
+# ---------------------------------------------------
+st.header("🔗 Cruce automático entre padrones")
+
+if len(dfs) >= 2:
+    st.write(f"Se cruzarán **{len(dfs)} padrones** por DNI.")
+
+    # Padrones únicos por DNI
+    padrones_con_dni = [d[d["dni"].astype(bool)] for d in dfs]
+
+    comunes = padrones_con_dni[0]
+    for d in padrones_con_dni[1:]:
+        comunes = comunes[comunes["dni"].isin(d["dni"])]
+
+    st.subheader(f"🎯 Coincidencias encontradas en los {len(dfs)} padrones")
+    st.write(f"Total coincidencias: **{len(comunes)}**")
+    st.dataframe(comunes)
+
+    # Diferencias entre cada padrón
+    st.subheader("🧩 Diferencias entre padrones")
+    for i, d in enumerate(padrones_con_dni):
+        faltan = comunes[~comunes["dni"].isin(d["dni"])]
+        st.write(f"➡️ Faltan en padrón {i+1}: {len(faltan)}")
+        st.dataframe(faltan)
+
+# ---------------------------------------------------
+# BUSQUEDA
+# ---------------------------------------------------
+st.header("🔎 Búsqueda")
+q = st.text_input("Buscar por DNI, apellido, nombre o mail")
 
 if q:
     ql = q.lower()
-    mask = df.apply(lambda r: ql in (
-        str(r["dni"]) + " " +
-        str(r["apellido"]).lower() + " " +
-        str(r["nombre"]).lower() + " " +
-        str(r["mail"]).lower()
-    ), axis=1)
-    st.dataframe(df[mask], use_container_width=True)
+    res = df[
+        df.apply(lambda r: ql in f"{r['dni']} {r['apellido'].lower()} {r['nombre'].lower()} {str(r['mail']).lower()}", axis=1)
+    ]
+    st.write(f"Resultados: {len(res)}")
+    st.dataframe(res)
 
+# ---------------------------------------------------
 # DUPLICADOS
-st.subheader("⚠️ Duplicados por DNI")
+# ---------------------------------------------------
+st.header("⚠️ Duplicados por DNI")
 dup = df[df.duplicated("dni", keep=False) & df["dni"].astype(bool)]
-if len(dup):
-    st.warning(f"{len(dup)} filas duplicadas | {dup['dni'].nunique()} DNIs")
+if not dup.empty:
+    st.warning(f"{dup['dni'].nunique()} DNIs duplicados - {len(dup)} filas")
     st.dataframe(dup)
 else:
-    st.success("Sin duplicados 👍")
+    st.success("Sin duplicados")
 
-# MÉTRICAS
-st.header("📊 Métricas")
-c1, c2, c3, c4 = st.columns(4)
-c1.metric("Total", len(df))
-c2.metric("Con mail", df["mail"].astype(bool).sum())
-c3.metric("Con fecha ingreso", df["fecha_ingreso"].notna().sum())
-c4.metric("Duplicados", dup["dni"].nunique())
+# ---------------------------------------------------
+# GRAFICOS
+# ---------------------------------------------------
+st.header("📊 Gráficos avanzados")
 
-# GRÁFICOS
-st.header("📈 Gráficos Avanzados")
-
-# Top apellidos
+st.subheader("Top 20 apellidos")
 top_ap = df["apellido"].value_counts().head(20)
-fig, ax = plt.subplots(figsize=(10,6))
+fig, ax = plt.subplots(figsize=(10,5))
 ax.barh(top_ap.index, top_ap.values, color="#c8102e")
 ax.invert_yaxis()
 st.pyplot(fig)
 
-# Nombres pie
+st.subheader("Nombres más comunes (Top 10)")
 top_n = df["nombre"].value_counts().head(10)
 fig2, ax2 = plt.subplots(figsize=(6,6))
 ax2.pie(top_n.values, labels=top_n.index, autopct="%1.1f%%")
+ax2.axis("equal")
 st.pyplot(fig2)
 
-# Boxplot DNI
-numeric_dni = pd.to_numeric(df["dni"], errors="coerce").dropna()
-fig3, ax3 = plt.subplots(figsize=(10,3))
-ax3.boxplot(numeric_dni, vert=False)
-st.pyplot(fig3)
+# ---------------------------------------------------
+# EXPORTAR
+# ---------------------------------------------------
+st.header("📥 Exportar padrón unificado")
+out = BytesIO()
+df.to_excel(out, index=False, engine="openpyxl")
+out.seek(0)
 
-# Heatmap iniciales
-df["ini_ap"] = df["apellido"].str[:1].str.upper()
-df["ini_no"] = df["nombre"].str[:1].str.upper()
-ct = pd.crosstab(df["ini_ap"], df["ini_no"])
-fig4, ax4 = plt.subplots(figsize=(10,6))
-sns.heatmap(ct, cmap="Reds")
-st.pyplot(fig4)
-
-# EXPORT EXCEL
-buf = BytesIO()
-df.to_excel(buf, index=False, engine="openpyxl")
-buf.seek(0)
-st.download_button("📥 Descargar Excel Procesado", buf,
-    "padron_unidad_roja_y_blanca.xlsx",
+st.download_button(
+    "Descargar Excel unificado",
+    data=out,
+    file_name="padron_unificado_unidad_roja_y_blanca.xlsx",
     mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
 )
 
-# ---------------------------------------------------------------------
-# 🔥 ***CRUCE MÚLTIPLE DE PADRONES*** (N archivos)
-# ---------------------------------------------------------------------
-st.header("🔗 Cruce de múltiples padrones (2, 3, 5, 10 o más)")
-
-multi_files = st.file_uploader(
-    "Subir varios padrones para cruzarlos entre sí",
-    type=["pdf","xlsx","xls","csv"],
-    accept_multiple_files=True
-)
-
-if multi_files:
-    st.info(f"Archivos subidos: {len(multi_files)}")
-
-    dfs = []
-    for f in multi_files:
-        d = load_file_to_df(f)
-        if not d.empty:
-            d["source"] = f.name
-            dfs.append(d)
-
-    if not dfs:
-        st.error("Ningún archivo válido.")
-        st.stop()
-
-    bigdf = pd.concat(dfs, ignore_index=True)
-
-    # Normalizar
-    bigdf["dni"] = bigdf["dni"].astype(str).str.replace(r"\D","",regex=True)
-    bigdf["mail"] = bigdf["mail"].astype(str).str.lower().str.strip()
-
-    # Coincidencias por DNI
-    st.subheader("📌 Coincidencias por DNI")
-    dup_all = bigdf[bigdf.duplicated("dni", keep=False) & bigdf["dni"].astype(bool)]
-    st.dataframe(dup_all)
-
-    # Coincidencias por mail
-    st.subheader("📌 Coincidencias por MAIL")
-    mail_dup = bigdf[bigdf.duplicated("mail", keep=False) & bigdf["mail"].astype(bool)]
-    st.dataframe(mail_dup)
-
-    # Conteo por archivo
-    st.subheader("📌 Cantidad de coincidencias por archivo")
-    cross_counts = dup_all.groupby("source")["dni"].count()
-    st.bar_chart(cross_counts)
-
-    # Exportar cruce
-    out = BytesIO()
-    with pd.ExcelWriter(out, engine="openpyxl") as writer:
-        dup_all.to_excel(writer, sheet_name="coincidencias_dni", index=False)
-        mail_dup.to_excel(writer, sheet_name="coincidencias_mail", index=False)
-        bigdf.to_excel(writer, sheet_name="todos_limpios", index=False)
-
-    out.seek(0)
-    st.download_button(
-        "📥 Descargar informe de cruces",
-        out,
-        "cruce_padrones.xlsx",
-        mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
-    )
-
-st.success("Listo rey 💪🔥 — Tu sistema está completo, procesando PDFs, Excel, mails y cruzando padrones sin límites.")
